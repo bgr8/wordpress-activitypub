@@ -23,7 +23,7 @@ class Test_Activitypub_Users_Collection extends WP_UnitTestCase {
 			);
 		}
 
-		$user = Activitypub\Collection\Users::get_by_resource( $resource );
+		$user = Activitypub\Collection\Actors::get_by_resource( $resource );
 
 		$this->assertInstanceOf( $expected, $user );
 	}
