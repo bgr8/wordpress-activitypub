@@ -36,6 +36,7 @@ class Enable_Mastodon_Apps {
 		\add_filter( 'mastodon_api_account_followers', array( self::class, 'api_account_followers' ), 10, 2 );
 		\add_filter( 'mastodon_api_account', array( self::class, 'api_account_external' ), 15, 2 );
 		\add_filter( 'mastodon_api_account', array( self::class, 'api_account_internal' ), 9, 2 );
+		\add_filter( 'mastodon_api_status', array( self::class, 'api_status' ), 9, 3 );
 		\add_filter( 'mastodon_api_search', array( self::class, 'api_search' ), 40, 2 );
 		\add_filter( 'mastodon_api_search', array( self::class, 'api_search_by_url' ), 40, 2 );
 		\add_filter( 'mastodon_api_get_posts_query_args', array( self::class, 'api_get_posts_query_args' ) );
@@ -323,6 +324,100 @@ class Enable_Mastodon_Apps {
 
 		return $account;
 	}
+
+	public static function api_status( $status, $post_id, $data ) {
+		$post = \get_post( $post_id );
+		if ( ! $post ) {
+			return $status;
+		}
+
+		// EMA makes a `comment` post_type to mirror comments and so that there can be a single get_posts() call for everything.
+		if ( get_post_type( $post ) === 'comment' ) {
+			$comment_id = get_post_meta( $post->ID, 'comment_id', true );
+			if ( $comment_id ) {
+				return self::api_comment_status( $comment_id );
+			}
+		}
+
+		return self::api_post_status( $post_id );
+	}
+
+	private static function api_post_status( $post_id ) {
+		return null;
+	}
+
+	private static function maybe_get_account_for_actor( $url ) {
+		$uri = Webfinger_Util::resolve( $url );
+		if ( $uri && ! is_wp_error( $uri ) ) {
+			return self::get_account_for_actor( $uri );
+		}
+		// Next, if the URL does not have a path, we'll try to resolve it in the form of domain.com@domain.com
+		$parts = \wp_parse_url( $url );
+		if ( ( ! isset( $parts['path'] ) || ! $parts['path'] ) && isset( $parts['host'] ) ) {
+			$url  = trailingslashit( $url ) . '@' . $parts['host'];
+			$acct = Webfinger_Util::uri_to_acct( $url );
+			if ( $acct && ! is_wp_error( $acct ) ) {
+				return self::get_account_for_actor( $acct );
+			}
+		}
+
+		return false;
+	}
+
+	private static function get_account_for_local_comment( $comment ) {
+		$maybe_actor = self::maybe_get_account_for_actor( $comment->comment_author_url );
+		if ( $maybe_actor ) {
+			return $maybe_actor;
+		}
+
+		// We will make a pretend local account for this comment.
+		$account                 = new Account();
+		$account->id             = PHP_INT_MAX; // This is a fake ID.
+		$account->username       = $comment->comment_author;
+		$account->acct           = $comment->comment_author_email;
+		$account->display_name   = $comment->comment_author;
+		$account->url            = get_comment_link( $comment );
+		$account->avatar         = get_avatar_url( $comment->comment_author_email );
+		$account->avatar_static  = $account->avatar;
+		$account->created_at     = new DateTime( $comment->comment_date_gmt );
+		$account->last_status_at = new DateTime( $comment->comment_date_gmt );
+		$account->note           = sprintf(
+			/* translators: %s: comment author name */
+			__( 'This is a classic comment by %s, not an ActivityPub comment.', 'activitypub' ), $comment->comment_author
+		);
+
+		return $account;
+	}
+
+	private static function api_comment_status( $comment_id ) {
+		$comment = get_comment( $comment_id );
+		if ( ! $comment ) {
+			return null;
+		}
+
+		$is_remote_comment = get_comment_meta( $comment->comment_ID, 'protocol', true ) === 'activitypub';
+
+		if ( $is_remote_comment ) {
+			$account = self::get_account_for_actor( $comment->comment_author_url );
+		} else {
+			$account = self::get_account_for_local_comment( $comment );
+		}
+
+		if ( ! $account ) {
+			return null;
+		}
+
+		$status             = new Status();
+		$status->id         = $comment->comment_ID;
+		$status->created_at = new DateTime( $comment->comment_date_gmt );
+		$status->content    = $comment->comment_content;
+		$status->account    = $account;
+		$status->visibility = 'public';
+		$status->url        = get_comment_link( $comment );
+
+		return $status;
+	}
+
 
 	/**
 	 * Get account for actor.
