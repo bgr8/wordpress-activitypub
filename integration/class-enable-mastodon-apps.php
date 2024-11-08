@@ -13,7 +13,7 @@ use Activitypub\Http;
 use Activitypub\Collection\Users;
 use Activitypub\Collection\Followers;
 use Activitypub\Collection\Extra_Fields;
-use Activitypub\Transformer\Post as Post_Transformer;
+use Activitypub\Transformer\Factory;
 use Enable_Mastodon_Apps\Mastodon_API;
 use Enable_Mastodon_Apps\Entity\Account;
 use Enable_Mastodon_Apps\Entity\Status;
@@ -361,8 +361,8 @@ class Enable_Mastodon_Apps {
 	 * @return Status|null The Mastodon API status object, or null if the post is not found
 	 */
 	private static function api_post_status( $post_id ) {
-		$post    = new Post_Transformer( $post_id );
-		$data    = $post->to_object();
+		$post    = Factory::get_transformer( get_post( $post_id ) );
+		$data    = $post->to_object()->to_array();
 		$account = self::api_account_internal( null, get_post_field( 'post_author', $post_id ) );
 		return self::activity_to_status( $data, $account );
 	}
@@ -410,7 +410,7 @@ class Enable_Mastodon_Apps {
 
 		// We will make a pretend local account for this comment.
 		$account                 = new Account();
-		$account->id             = PHP_INT_MAX; // This is a fake ID.
+		$account->id             = 999999; // This is a fake ID.
 		$account->username       = $comment->comment_author;
 		$account->acct           = sprintf( 'comments@%s', wp_parse_url( home_url(), PHP_URL_HOST ) );
 		$account->display_name   = $comment->comment_author;
@@ -447,6 +447,8 @@ class Enable_Mastodon_Apps {
 
 		if ( $is_remote_comment ) {
 			$account = self::get_account_for_actor( $comment->comment_author_url );
+			// @todo fallback to locally stored data from the time the comment was made,
+			// if the remote actor is not found/no longer available.
 		} else {
 			$account = self::get_account_for_local_comment( $comment );
 		}
@@ -476,7 +478,7 @@ class Enable_Mastodon_Apps {
 	 * @return Account|null The account.
 	 */
 	private static function get_account_for_actor( $uri ) {
-		if ( ! is_string( $uri ) ) {
+		if ( ! is_string( $uri ) || empty( $uri ) ) {
 			return null;
 		}
 		$data = get_remote_metadata_by_actor( $uri );
@@ -487,6 +489,10 @@ class Enable_Mastodon_Apps {
 		$account = new Account();
 
 		$acct = Webfinger_Util::uri_to_acct( $uri );
+		if ( ! $acct || is_wp_error( $acct ) ) {
+			return null;
+		}
+
 		if ( str_starts_with( $acct, 'acct:' ) ) {
 			$acct = substr( $acct, 5 );
 		}
