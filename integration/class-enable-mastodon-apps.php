@@ -13,6 +13,7 @@ use Activitypub\Http;
 use Activitypub\Collection\Users;
 use Activitypub\Collection\Followers;
 use Activitypub\Collection\Extra_Fields;
+use Activitypub\Transformer\Post as Post_Transformer;
 use Enable_Mastodon_Apps\Mastodon_API;
 use Enable_Mastodon_Apps\Entity\Account;
 use Enable_Mastodon_Apps\Entity\Status;
@@ -36,7 +37,7 @@ class Enable_Mastodon_Apps {
 		\add_filter( 'mastodon_api_account_followers', array( self::class, 'api_account_followers' ), 10, 2 );
 		\add_filter( 'mastodon_api_account', array( self::class, 'api_account_external' ), 15, 2 );
 		\add_filter( 'mastodon_api_account', array( self::class, 'api_account_internal' ), 9, 2 );
-		\add_filter( 'mastodon_api_status', array( self::class, 'api_status' ), 9, 3 );
+		\add_filter( 'mastodon_api_status', array( self::class, 'api_status' ), 9, 2 );
 		\add_filter( 'mastodon_api_search', array( self::class, 'api_search' ), 40, 2 );
 		\add_filter( 'mastodon_api_search', array( self::class, 'api_search_by_url' ), 40, 2 );
 		\add_filter( 'mastodon_api_get_posts_query_args', array( self::class, 'api_get_posts_query_args' ) );
@@ -325,7 +326,15 @@ class Enable_Mastodon_Apps {
 		return $account;
 	}
 
-	public static function api_status( $status, $post_id, $data ) {
+	/**
+	 * Use our representation of posts to power each status item.
+	 * Includes proper referncing of 3rd party comments that arrived via federation.
+	 *
+	 * @param null|Status $status The status, typically null to allow later filters their shot.
+	 * @param int         $post_id The post ID.
+	 * @return Status|null The status.
+	 */
+	public static function api_status( $status, $post_id ) {
 		$post = \get_post( $post_id );
 		if ( ! $post ) {
 			return $status;
@@ -335,23 +344,45 @@ class Enable_Mastodon_Apps {
 		if ( get_post_type( $post ) === 'comment' ) {
 			$comment_id = get_post_meta( $post->ID, 'comment_id', true );
 			if ( $comment_id ) {
-				return self::api_comment_status( $comment_id );
+				return self::api_comment_status( $comment_id, $post_id );
 			}
 		}
 
 		return self::api_post_status( $post_id );
 	}
 
+	/**
+	 * Transforms a WordPress post into a Mastodon-compatible status object.
+	 *
+	 * Takes a post ID, transforms it into an ActivityPub object, and converts
+	 * it to a Mastodon API status format including the author's account info.
+	 *
+	 * @param int $post_id The WordPress post ID to transform.
+	 * @return Status|null The Mastodon API status object, or null if the post is not found
+	 */
 	private static function api_post_status( $post_id ) {
-		return null;
+		$post    = new Post_Transformer( $post_id );
+		$data    = $post->to_object();
+		$account = self::api_account_internal( null, get_post_field( 'post_author', $post_id ) );
+		return self::activity_to_status( $data, $account );
 	}
 
+	/**
+	 * Traditional WP commenters may leave a URL, which itself may be a valid actor.
+	 * If so, we'll use that actor's data to represent the comment.
+	 *
+	 * @param string $url The URL.
+	 * @return Account|false The account or false.
+	 */
 	private static function maybe_get_account_for_actor( $url ) {
+		if ( empty( $url ) ) {
+			return false;
+		}
 		$uri = Webfinger_Util::resolve( $url );
 		if ( $uri && ! is_wp_error( $uri ) ) {
 			return self::get_account_for_actor( $uri );
 		}
-		// Next, if the URL does not have a path, we'll try to resolve it in the form of domain.com@domain.com
+		// Next, if the URL does not have a path, we'll try to resolve it in the form of domain.com@domain.com.
 		$parts = \wp_parse_url( $url );
 		if ( ( ! isset( $parts['path'] ) || ! $parts['path'] ) && isset( $parts['host'] ) ) {
 			$url  = trailingslashit( $url ) . '@' . $parts['host'];
@@ -364,6 +395,13 @@ class Enable_Mastodon_Apps {
 		return false;
 	}
 
+	/**
+	 * Convert an local WP comment into a pseudo-account, after first checking if their
+	 * supplied URL is a valid actor.
+	 *
+	 * @param \WP_Comment $comment The comment.
+	 * @return Account The account.
+	 */
 	private static function get_account_for_local_comment( $comment ) {
 		$maybe_actor = self::maybe_get_account_for_actor( $comment->comment_author_url );
 		if ( $maybe_actor ) {
@@ -374,7 +412,7 @@ class Enable_Mastodon_Apps {
 		$account                 = new Account();
 		$account->id             = PHP_INT_MAX; // This is a fake ID.
 		$account->username       = $comment->comment_author;
-		$account->acct           = $comment->comment_author_email;
+		$account->acct           = sprintf( 'comments@%s', wp_parse_url( home_url(), PHP_URL_HOST ) );
 		$account->display_name   = $comment->comment_author;
 		$account->url            = get_comment_link( $comment );
 		$account->avatar         = get_avatar_url( $comment->comment_author_email );
@@ -383,15 +421,25 @@ class Enable_Mastodon_Apps {
 		$account->last_status_at = new DateTime( $comment->comment_date_gmt );
 		$account->note           = sprintf(
 			/* translators: %s: comment author name */
-			__( 'This is a classic comment by %s, not an ActivityPub comment.', 'activitypub' ), $comment->comment_author
+			__( 'This is a classic comment by %s, not an ActivityPub comment.', 'activitypub' ),
+			$comment->comment_author
 		);
 
 		return $account;
 	}
 
-	private static function api_comment_status( $comment_id ) {
+	/**
+	 * Convert a WordPress comment to a Status.
+	 *
+	 * @param int $comment_id The comment ID.
+	 * @param int $post_id    The post ID (this is the mirrored `comment` post).
+	 *
+	 * @return Status|null The status.
+	 */
+	private static function api_comment_status( $comment_id, $post_id ) {
 		$comment = get_comment( $comment_id );
-		if ( ! $comment ) {
+		$post    = get_post( $post_id );
+		if ( ! $comment || ! $post ) {
 			return null;
 		}
 
@@ -407,13 +455,14 @@ class Enable_Mastodon_Apps {
 			return null;
 		}
 
-		$status             = new Status();
-		$status->id         = $comment->comment_ID;
-		$status->created_at = new DateTime( $comment->comment_date_gmt );
-		$status->content    = $comment->comment_content;
-		$status->account    = $account;
-		$status->visibility = 'public';
-		$status->url        = get_comment_link( $comment );
+		$status                 = new Status();
+		$status->id             = $comment->comment_ID;
+		$status->created_at     = new DateTime( $comment->comment_date_gmt );
+		$status->content        = $comment->comment_content;
+		$status->account        = $account;
+		$status->visibility     = 'public';
+		$status->uri            = get_comment_link( $comment );
+		$status->in_reply_to_id = $post->post_parent;
 
 		return $status;
 	}
