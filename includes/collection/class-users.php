@@ -63,7 +63,7 @@ class Users {
 			case self::APPLICATION_USER_ID:
 				return new Application();
 			default:
-				return User::from_wp_user($user_id);
+				return User::from_wp_user( $user_id );
 		}
 
 		return new WP_Error(
