@@ -57,7 +57,7 @@ class Users {
 			);
 		}
 
-		switch ($user_id) {
+		switch ( $user_id ) {
 			case self::BLOG_USER_ID:
 				return new Blog();
 			case self::APPLICATION_USER_ID:
